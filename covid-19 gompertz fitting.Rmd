@@ -1,0 +1,629 @@
+---
+title: "Covid-19 prediction UK"
+author: "Kevin Hon Yin Hau"
+date: "18/03/2020"
+output: html_document
+---
+
+```{r setup, include=TRUE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+For most update news in UK, please visit 
+https://coronavirus.data.gov.uk/
+
+# Covid-19 Total Cases prediction
+
+
+Update on
+```{r}
+Sys.time()
+```
+
+
+### Library
+```{r library, include=TRUE}
+library(ggplot2)
+library(stringi)
+library(dplyr)
+
+# if xlsx format
+library(openxlsx)
+library(janitor)
+```
+
+## Data
+File format and structure keeps changing, and it might need to change for different day
+```{r data, include=TRUE}
+# file name
+
+#xlFile <- paste0("COVID-19-geographic-disbtribution-worldwide-",Sys.Date(),".xls")
+#DF <- read_xls(paste0("C:\\Users\\",Sys.getenv("username"),"\\Downloads\\",xlFile))
+DF <- openxlsx::read.xlsx(paste0("https://www.ecdc.europa.eu/sites/default/files/documents/COVID-19-geographic-disbtribution-worldwide-",Sys.Date(),".xlsx"))
+
+names(DF)[c(1,5:7,11)] <- c('DateRep','NewConfCases','NewDeaths','CountryExp','x')
+DF$CountryExp <- stri_trans_general(gsub("_"," ", DF$CountryExp), id = "Title")
+#DF$DateRep <- as.Date(as.character(DF$DateRep), "%d/%m/%Y")
+DF$DateRep <- janitor::excel_numeric_to_date(DF$DateRep)
+
+```
+
+## Statistics by Country
+
+```{r stat, echo=TRUE, paged.print=TRUE}
+DF_New <- DF %>% inner_join(DF %>% group_by(CountryExp) %>% summarise(DateRep=max(DateRep))) %>% 
+  select(CountryExp,NewConfCases,NewDeaths) %>% 
+  arrange(desc(NewConfCases))
+
+DF_Stat <- DF %>% 
+  group_by(CountryExp) %>%
+  summarise(Total=sum(NewConfCases, na.rm=T),
+            Death=sum(NewDeaths, na.rm=T)) %>%
+  left_join(DF_New) %>% 
+  arrange(desc(NewDeaths))
+
+kable(rbind(data.frame(CountryExp="Overall", 
+                       DF_Stat %>% 
+                         summarise(Total=sum(Total), 
+                                  Death=sum(Death),
+                                  NewConfCases=sum(NewConfCases, na.rm=TRUE),
+                                  NewDeaths=sum(NewDeaths, na.rm=TRUE))),
+                                  DF_Stat %>% 
+              filter(Total>20000)), 
+      caption="Statistics around the world with total cases > 20000")
+```
+
+## For some countries over 50k cases (not include USA)
+```{r cases50k, include=TRUE}
+num <- 50000
+
+Country_num <- DF_Stat %>% 
+  group_by(CountryExp) %>% 
+  summarise(Total=sum(Total)) %>% 
+  filter(Total>num) %>% 
+  arrange(Total) %>% 
+  select(CountryExp)
+
+DF_num <- DF %>% 
+  inner_join(Country_num) %>% 
+  arrange(CountryExp, DateRep) %>%
+  group_by(CountryExp) %>% 
+  mutate(Total = cumsum(NewConfCases), TotalDeath = cumsum(NewDeaths)) %>% 
+  filter(Total >= 10000 & CountryExp != "United States Of America") %>% 
+  mutate(Day = 1:n()) %>% 
+  select(CountryExp, DateRep, Day, Total, TotalDeath)
+
+DF_num_country <- DF_num %>% 
+  group_by(CountryExp) %>% 
+  summarise(Day=max(Day), Total=max(Total), TotalDeath =max(TotalDeath)) %>% 
+  filter(TotalDeath >= 1000)
+
+
+ggplot(DF_num %>% inner_join(DF_num_country[,"CountryExp"]), aes(Day, Total, group=CountryExp, col=CountryExp)) + 
+  geom_line() + 
+  geom_point(data=DF_num_country, aes(Day,Total,size=TotalDeath), alpha=0.2) + 
+  geom_text(data=DF_num_country, aes(x=Day+0.8*nchar(CountryExp),y=Total,label=CountryExp),size=3) + 
+  theme(legend.position="none")+ xlim(0,max(DF_num_country$Day)+10) + labs(x="Day since >=100 cases",y="Total Cases (size of points represents total deaths)")
+
+```
+
+
+##Define 2 Gompertz abcd / bcd (with a=0) and Baranyi 94 Model with Self Start function
+```{r SelfStartGompertz, include=TRUE}
+SSgompertzabcd <- function (time, a, b, c, d) {
+  partEq_ <- exp(1 + c*exp(1)*(b - time)/(d - a))
+  partEq <- exp(-partEq_)
+  partGrad <- (d - a) * (partEq * (partEq_ * (c*exp(1)*(b - time)/(d - a)^2)))
+  val <- a + (d - a) * partEq
+  .grad <- array(0, c(length(val), 4), list(NULL, c("a", "b", "c", "d")))
+  .grad[, "a"] <- 1 - (partGrad + partEq)
+  .grad[, "b"] <- -((d - a) * (partEq * (partEq_ * (c * exp(1)/(d - a)))))
+  .grad[, "c"] <- -((d - a) * (partEq * (partEq_ * (exp(1) * (b - time)/(d - a)))))
+  .grad[, "d"] <- partEq + partGrad
+  attr(val, "gradient") <- .grad
+  val
+}
+
+attributes(SSgompertzabcd)$initial <- function (mCall, data, LHS){
+  sXY <- sortedXyData(mCall[["time"]], LHS, data)
+  if(nrow(sXY) < 5) stop("Too few distinct input values to fit the Gompertz model")
+  y0 <- NLSstLfAsymptote(sXY)
+  ymax <- NLSstRtAsymptote(sXY)
+  # rate is a positive value in the direction of change
+  grad <- diff(sXY$y, 1)/diff(sXY$x, 1)
+  rate <- max(grad)
+  xpos <- which(grad == rate)[1]
+  lag <- mean(sXY$x[c(xpos-2, xpos + 2)]) - (mean(sXY$y[c(xpos-2, xpos + 2)]) - y0)/rate
+  if(!is.finite(lag)) lag <- 0
+  val <- c(max(y0,0.1), lag, rate, ymax)
+  names(val) <- mCall[c("a", "b", "c", "d")]
+  val
+}
+
+attributes(SSgompertzabcd)$pnames <- c("a","b","c","d")
+attributes(SSgompertzabcd)$class <- "selfStart"
+
+SSgompertzbcd <- function (time, b, c, d) {
+  a <- 0
+  partEq_ <- exp(1 + c*exp(1)*(b - time)/(d - a))
+  partEq <- exp(-partEq_)
+  partGrad <- (d - a) * (partEq * (partEq_ * (c*exp(1)*(b - time)/(d - a)^2)))
+  val <- a + (d - a) * partEq
+  .grad <- array(0, c(length(val), 3), list(NULL, c("b", "c", "d")))
+  .grad[, "b"] <- -((d - a) * (partEq * (partEq_ * (c * exp(1)/(d - a)))))
+  .grad[, "c"] <- -((d - a) * (partEq * (partEq_ * (exp(1) * (b - time)/(d - a)))))
+  .grad[, "d"] <- partEq + partGrad
+  attr(val, "gradient") <- .grad
+  val
+}
+
+attributes(SSgompertzbcd)$initial <- function (mCall, data, LHS){
+  sXY <- sortedXyData(mCall[["time"]], LHS, data)
+  if (nrow(sXY) < 5) stop("Too few distinct input values to fit the Gompertz model")
+  y0 <- 0
+  ymax <- NLSstRtAsymptote(sXY)
+  # rate is a positive value in the direction of change
+  grad <- diff(sXY$y, 2)/diff(sXY$x, 2)
+  rate <- max(grad)
+  xpos <- which(grad == rate)[1]
+  lag <- mean(sXY$x[c(xpos, xpos + 2)]) - (mean(sXY$y[c(xpos, xpos + 2)]) - y0)/rate
+  if(!is.finite(lag)) lag <- 0
+  val <- c(lag, rate, max(ymax,sXY$y))
+  names(val) <- mCall[c("b", "c", "d")]
+  val
+}
+
+attributes(SSgompertzbcd)$pnames <- c("b","c","d")
+attributes(SSgompertzbcd)$class <- "selfStart"
+
+SSbaranyi <- function (Time, y0, ymax, mu, lambda, m = 1, v = mu) 
+{
+  q0 <- 1/(exp(mu * lambda) - 1)
+  A <- Time + log((exp(-mu * Time) + q0)/(1 + q0))/mu
+  y <- ymax - log(1 + (exp((ymax - y0)) - 1)/exp(mu * A))
+  y
+}
+
+attributes(SSbaranyi)$initial <- function (mCall, data, LHS){
+  sXY <- sortedXyData(mCall[["time"]], LHS, data)
+  if(nrow(sXY) < 5) stop("Too few distinct input values to fit the baranyi model")
+  val_ <- getInitial(y ~ SSgompertzabcd(x, a,b,c,d), sXY)
+  val <-val_[c(1,4,3,2)]
+  names(val) <- mCall[c("y0", "ymax", "mu", "lambda")]
+  val
+}
+attributes(SSbaranyi)$pnames <- c("y0", "ymax", "mu", "lambda")
+attributes(SSbaranyi)$class <- "selfStart"
+```
+
+ 
+Function (covid_NLS_Graph) Return Selected Data, NLS model for total cases/deaths, and chart
+
+```{r function, include=TRUE}
+covid_NLS_Graph <- function(DF, countryName=NA, predictDays=100){
+  require(dplyr)
+  require(ggplot2)
+  require(egg)
+  
+  if(length(countryName)==0||is.na(countryName)||countryName=="all"){
+    DF_country <- DF %>%
+      group_by(DateRep) %>%
+      summarise(NewConfCases=sum(NewConfCases),
+                NewDeaths=sum(NewDeaths)) %>% mutate(CountryExp="All")
+  } else {
+    DF_country <- DF %>%
+      filter(tolower(CountryExp) %in% tolower(countryName)) %>%
+      arrange(DateRep)
+  }
+  
+  DF_country_new <- DF_country %>% filter(DateRep == max(DateRep))
+  
+  DF_country <- as.data.frame(DF_country %>% 
+                                mutate(Total = cumsum(NewConfCases),
+                                       TotalDeath = cumsum(NewDeaths),
+                                       DateDiff = as.Date(DateRep) - lag(as.Date(DateRep))) %>% filter(Total>0) %>% mutate(Day = cumsum(coalesce(as.integer(DateDiff),0L))))
+  
+  print(tail(DF_country[,c("DateRep","Day","CountryExp","NewConfCases","NewDeaths","Total","TotalDeath")]))
+  
+  logFit <- FALSE
+  logDeathFit <- FALSE
+  
+  #############################################
+  
+  chkSF <- function(model){
+    if(class(model)=="nls"){
+      if(sum(summary(model)$parameters[2:nrow(summary(model)$parameters),4] > 0.1)>=1) {
+        returnClass <- "try-error"
+      } else returnClass <- "nls"
+    } else {
+      returnClass <- "try-error"
+    }
+    returnClass
+  }
+  
+  ## first try 3 models
+  virus_fit <-try(nls(Total ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country ), TRUE)
+  class(virus_fit) <- chkSF(virus_fit)
+  
+  if(class(virus_fit)=="try-error"){
+    virus_fit <-try(nls(Total ~ SSbaranyi(Day, y0, ymax, mu, lambda), data=DF_country ), TRUE)
+    class(virus_fit) <- chkSF(virus_fit)
+  }
+  
+  if(class(virus_fit)=="try-error"){
+    virus_fit <-try(nls(Total ~ SSgompertzbcd(Day, b, c, d), data=DF_country ), TRUE)
+    class(virus_fit) <- chkSF(virus_fit)
+  } 
+  
+  if(class(virus_fit)=="try-error"){
+    for(i in (nrow(DF_country)-1):(nrow(DF_country)-5)){
+      if(class(virus_fit)=="try-error"){
+        virus_fit <-try(nls(Total ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+        class(virus_fit) <- chkSF(virus_fit)
+        
+        if(class(virus_fit)=="try-error"){
+          virus_fit <-try(nls(Total ~ SSbaranyi(Day, y0, ymax, mu, lambda), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+          class(virus_fit) <- chkSF(virus_fit)
+        }
+        
+        if(class(virus_fit)=="try-error"){
+          virus_fit <-try(nls(Total ~ SSgompertzbcd(Day, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+          class(virus_fit) <- chkSF(virus_fit)
+        }
+        
+        if(class(virus_fit)=="nls") cat(paste0("total case take out ",paste(i:nrow(DF_country),collapse=",")))
+      } 
+    }
+  }
+  
+  if(class(virus_fit)=="nls") Fit <- predict(virus_fit,newdata=data.frame(Day=1:predictDays))
+  
+  if(class(virus_fit)=="try-error"){
+    virus_fit <-try(nls(I(log(Total+1)) ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country ), TRUE)
+    class(virus_fit) <- chkSF(virus_fit)
+    
+    if(class(virus_fit)=="try-error"){
+      virus_fit <-try(nls(I(log(Total+1)) ~ SSbaranyi(Day, y0, ymax, mu, lambda), data=DF_country ), TRUE)
+      class(virus_fit) <- chkSF(virus_fit)
+    }
+    
+    if(class(virus_fit)=="try-error"){
+      virus_fit <-try(nls(I(log(Total+1)) ~ SSgompertzbcd(Day, b, c, d), data=DF_country ), TRUE)
+      class(virus_fit) <- chkSF(virus_fit)
+    }
+    
+    if(class(virus_fit)=="try-error"){
+      for(i in (nrow(DF_country)-1):(nrow(DF_country)-5)){
+        if(class(virus_fit)=="try-error"){
+          virus_fit <-try(nls(I(log(Total+1)) ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+          class(virus_fit) <- chkSF(virus_fit)
+          
+          if(class(virus_fit)=="try-error"){
+            virus_fit <-try(nls(I(log(Total+1)) ~ SSbaranyi(Day, y0, ymax, mu, lambda), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+            class(virus_fit) <- chkSF(virus_fit)
+          }
+          
+          if(class(virus_fit)=="try-error"){
+            virus_fit <-try(nls(I(log(Total+1)) ~ SSgompertzbcd(Day, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+            class(virus_fit) <- chkSF(virus_fit)
+          }
+          if(class(virus_fit)=="nls") cat(paste0("log(total case + 1) take out ",paste(i:nrow(DF_country),collapse=",")))
+        } 
+      }
+    }
+    if(class(virus_fit)=="nls") {
+      Fit <- exp(predict(virus_fit,newdata=data.frame(Day=1:predictDays)))
+      logFit <- TRUE
+    }
+  }
+  
+  
+  ############################################
+  
+  death_fit <-try(nls(TotalDeath ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country ), TRUE)
+  class(death_fit) <- chkSF(death_fit)
+  
+  if(class(death_fit)=="try-error"){
+    death_fit <-try(nls(TotalDeath ~ SSgompertzbcd(Day, b, c, d), data=DF_country ), TRUE)
+    class(death_fit) <- chkSF(death_fit)
+  }
+  
+  if(class(death_fit)=="try-error"){
+    for(i in (nrow(DF_country)-1):(nrow(DF_country)-5)){
+      if(class(death_fit)=="try-error"){
+        death_fit <-try(nls(TotalDeath ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+        class(death_fit) <- chkSF(death_fit)
+        
+        if(class(death_fit)=="try-error"){
+          death_fit <-try(nls(TotalDeath ~ SSgompertzbcd(Day, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+          class(death_fit) <- chkSF(death_fit)
+        }
+        if(class(death_fit)=="nls") cat(paste0("total death take out rows: ",paste(i:(nrow(DF_country)-1),collapse=",")))
+      } 
+    }
+  }
+  
+  if(class(death_fit)=="nls") Fit_Death <- predict(death_fit,newdata=data.frame(Day=1:predictDays))
+  
+  if(class(death_fit)=="try-error"){
+    death_fit <-try(nls(I(log(TotalDeath+1)) ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country ), TRUE)
+    class(death_fit) <- chkSF(death_fit)
+    
+    if(class(death_fit)=="try-error"){
+      death_fit <-try(nls(I(log(TotalDeath+1)) ~ SSgompertzbcd(Day, b, c, d), data=DF_country ), TRUE)
+      class(death_fit) <- chkSF(death_fit)
+    }
+    
+    if(class(death_fit)=="try-error"){
+      for(i in (nrow(DF_country)-1):(nrow(DF_country)-5)){
+        if(class(death_fit)=="try-error"){
+          death_fit <-try(nls(I(log(TotalDeath+1)) ~ SSgompertzabcd(Day, a, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+          class(death_fit) <- chkSF(death_fit)
+          
+          if(class(death_fit)=="try-error"){
+            death_fit <-try(nls(I(log(TotalDeath+1)) ~ SSgompertzbcd(Day, b, c, d), data=DF_country[-(i:(nrow(DF_country)-1)),] ), TRUE)
+            class(death_fit) <- chkSF(death_fit)
+          }
+          if(class(death_fit)=="nls") cat(paste0("log(total death + 1) take out rows: ",paste(i:(nrow(DF_country)-1),collapse=",")))
+        } 
+      }
+    }
+    if(class(death_fit)=="nls") {
+      Fit_Death <- exp(predict(death_fit,newdata=data.frame(Day=1:predictDays)))
+      logDeathFit <- TRUE
+    }
+  }
+  
+  ############################################
+  
+  
+  gphTotal <- ggplot(DF_country, aes(Day, Total)) +
+    geom_point(col="blue", size=3)  +
+    labs(title=paste0(countryName, " Covid-19 Overall Cumulative Cases & Deaths"),
+         x=paste0("Day from ",as.Date(min(DF_country$DateRep))))+ 
+    theme(plot.title = element_text(size=16)) 
+  
+  gphDeath <- ggplot(DF_country, aes(Day, TotalDeath)) +
+    geom_point(col="green", size=3)  +
+    labs(title="",
+         x=paste0("Day from ",as.Date(min(DF_country$DateRep))))+ 
+    theme(plot.title = element_text(size=16)) 
+  
+  
+  if(class(virus_fit)!="try-error")  {
+    gphTotal <- gphTotal +
+                   geom_line(data=data.frame(Day=1:predictDays,Fit=Fit),
+                     mapping=aes(Day,Fit),col="red", size=1) +
+                   labs(subtitle= paste0("Predicted on ",as.Date(max(DF_country$DateRep))))
+    
+    DF_country$FitTotal <- ifelse(logFit, exp(predict(virus_fit,newdata=DF_country)), predict(virus_fit,newdata=DF_country))
+    
+    if(logFit) cat("Total cases transformed to log (base e) \n")
+  } else {
+    gphTotal <- gphTotal + labs(subtitle= paste0("Updated on ",as.Date(max(DF_country$DateRep))))
+  }
+  
+  if(class(death_fit)!="try-error")  {
+    gphDeath <- gphDeath +
+      geom_line(data=data.frame(Day=1:predictDays,Fit=Fit_Death),
+                mapping=aes(Day,Fit_Death),col="red", size=1) +
+      labs(subtitle= paste0("Predicted on ",as.Date(max(DF_country$DateRep))))
+    
+    DF_country$FitDeath <- ifelse(logDeathFit, exp(predict(death_fit,newdata=DF_country)), predict(death_fit,newdata=DF_country))
+    
+    if(logDeathFit) cat("Total Death transformed to log (base e) \n")
+  } else {
+    gphDeath <- gphDeath + labs(subtitle= paste0("Updated on ",as.Date(max(DF_country$DateRep))))
+  }
+  
+  return(list(data = DF_country, 
+              modelTotal = virus_fit, 
+              modelDeath = death_fit, 
+              graphTotal = gphTotal,
+              graphDeath = gphDeath))
+}
+```
+
+## Return the covid-19 model result for UK
+```{r run, include=FALSE}
+covid_19 <- covid_NLS_Graph(DF,countryName="United Kingdom",predictDays=250)
+#
+UK_7_Days_Ago <- covid_NLS_Graph(DF %>% filter(CountryExp == "United Kingdom", DateRep <= Sys.Date()-7),countryName="United Kingdom",predictDays=250)
+#
+#if(class(covid_19$modelTotal)!="try-error" & class(UK_7_Days_Ago$modelTotal)!="try-error"){
+#  
+#  last_pred_max <- as.numeric(predict(UK_7_Days_Ago$modelTotal,data.frame(Day=250)))
+#  
+#  if(length(grep("log",as.character(as.list(UK_7_Days_Ago$modelTotal$call)[[2]])))>0) {
+#    last_pred_max <- exp(last_pred_max)
+#  } 
+#  
+#  covid_19$graphTotal <- covid_19$graphTotal + 
+#      geom_hline(yintercept=last_pred_max,col="orange", size=1.5) + 
+#      geom_label(mapping=aes(x=200,y=last_pred_max*0.95,label="predicted max a week ago"))
+##  
+#}
+#
+#if(class(covid_19$modelDeath)!="try-error" & class(UK_7_Days_Ago$modelDeath)!="try-error"){
+#  
+#  last_pred_max_death <- #as.numeric(predict(UK_7_Days_Ago$modelDeath,data.frame(Day=250)))
+#  
+#  if(length(grep("log",as.character(as.list(UK_7_Days_Ago$modelDeath$call)[[2]])))>0) {
+#    last_pred_max_death <- exp(last_pred_max_death)
+#  } 
+#  covid_19$graphDeath <- covid_19$graphDeath + 
+#      geom_hline(yintercept=last_pred_max_death,col="orange", size=1.5) + 
+#      geom_label(mapping=aes(x=200, y = last_pred_max_death*0.95,label="predicted #max a week ago"))
+#}
+
+#can use this command in the computer for selecting country 
+#countryName=DF_Stat$CountryExp[menu(DF_Stat$CountryExp,T)],
+
+#
+#china <- covid_NLS_Graph(DF,
+#                 countryName="China",
+#                 predictDays=250)#
+#
+#ggarrange(china$graphTotal+ geom_vline(xintercept=23,col="purple") +annotate("text", #label="Lockdown day23", x=23, y=82500, size=2,col="purple"), china$graphDeath+ #geom_vline(xintercept=23,col="purple"), ncol=2)
+
+                 
+```
+
+## NLS Model Result for UK
+Note that when you know that some governments are not going to test it and report it, it really doesn't matter what the model is like ...
+```{r model}
+if(class(covid_19$modelTotal)!="try-error")  {
+  print(summary(covid_19$modelTotal))
+} else {
+  print("Algorithm is not converge for modelling total cases")
+}
+
+if(class(covid_19$modelDeath)!="try-error")  {
+  print(summary(covid_19$modelDeath))
+} else {
+  print("Algorithm is not converge for modelling total deaths")
+}
+
+```
+If the algorithm is not able to converge after some trying,
+the function will just show the graph with count
+
+
+## Country Data
+```{r output data, paged.print=TRUE}
+OutputData <- covid_19$data %>% 
+               select(DateRep, Day, CountryExp, NewConfCases, NewDeaths,
+                      Total, TotalDeath) %>%  
+               arrange(desc(Day))
+print(head(OutputData,10))
+
+```
+
+```{r graph}
+
+ggarrange(covid_19$graphTotal, covid_19$graphDeath, ncol=2)
+
+```
+
+Note that, this exercise is just simple way of looking at the problem, and it's rather like a starting point. The algorithm with the self starting function in nls is the first way to go, but there are much more after this. In the function, a is the left asymptote, b is the lag time, i.e. the time to grow, c is the growth rate, and d is the right asymptote. b, c, d should be modelled as well, and combine into one, with other factors like age, sex, other complication, population density, propotion of people wearing mask, population that is travelling during pandemic, etc... However, if a lot of cases are not tested, the number is not correct, this can be reflected from the death rate.
+
+
+
+
+## USA
+```{r USA}
+usa <- covid_NLS_Graph(DF,
+                 countryName="United States Of America",
+                 predictDays=250)
+
+ggarrange(usa$graphTotal, usa$graphDeath, ncol=2)
+print(usa$modelTotal)
+print(usa$modelDeath)
+```
+
+## Italy
+```{r italy}
+italy <- covid_NLS_Graph(DF,
+                 countryName="Italy",
+                 predictDays=250)
+
+ggarrange(italy$graphTotal, italy$graphDeath, ncol=2)
+print(italy$modelTotal)
+print(italy$modelDeath)
+
+```
+
+## Spain
+```{r Spain}
+spain <- covid_NLS_Graph(DF,
+                 countryName="Spain",
+                 predictDays=250)
+ggarrange(spain$graphTotal, spain$graphDeath, ncol=2)
+print(spain$modelTotal)
+print(spain$modelDeath)
+
+```
+
+## Germany
+```{r germany}
+germany <- covid_NLS_Graph(DF,
+                 countryName="Germany",
+                 predictDays=250)
+ggarrange(germany$graphTotal, germany$graphDeath, ncol=2)
+print(germany$modelTotal)
+print(germany$modelDeath)
+
+```
+
+## France
+```{r france}
+france <- covid_NLS_Graph(DF,
+                 countryName="France",
+                 predictDays=250)
+ggarrange(france$graphTotal, france$graphDeath, ncol=2)
+print(france$modelTotal)
+print(france$modelDeath)
+
+```
+
+
+## Brazil
+```{r brazil}
+brazil <- covid_NLS_Graph(DF,
+                 countryName="Brazil",
+                 predictDays=500)
+ggarrange(brazil$graphTotal, brazil$graphDeath, ncol=2)
+print(brazil$modelTotal)
+print(brazil$modelDeath)
+
+```
+
+## Russia
+```{r russia}
+russia <- covid_NLS_Graph(DF,
+                 countryName="Russia",
+                 predictDays=500)
+ggarrange(russia$graphTotal, russia$graphDeath, ncol=2)
+print(russia$modelTotal)
+print(russia$modelDeath)
+
+```
+
+
+## India
+```{r india}
+india <- covid_NLS_Graph(DF,
+                 countryName="India",
+                 predictDays=500)
+ggarrange(india$graphTotal, india$graphDeath, ncol=2)
+print(india$modelTotal)
+print(india$modelDeath)
+
+```
+
+hmmm....
+
+## All
+```{r All}
+DF_all <- DF %>% group_by(DateRep) %>% summarise(NewConfCases=sum(NewConfCases), NewDeaths=sum(NewDeaths)) %>% mutate(CountryExp="All")
+All_cases <- covid_NLS_Graph(DF_all, "All", predictDays = 1000)
+ggarrange(All_cases$graphTotal, All_cases$graphDeath, ncol=2)
+print(All_cases$modelTotal)
+print(All_cases$modelDeath)
+
+
+```
+
+
+## All but China
+```{r All but China}
+DF_all_exclude_China <- DF %>% filter(CountryExp != "China") %>% group_by(DateRep) %>% summarise(NewConfCases=sum(NewConfCases), NewDeaths=sum(NewDeaths)) %>% mutate(CountryExp="All but China")
+All_but_china <- covid_NLS_Graph(DF_all_exclude_China, "All but China", predictDays = 1000)
+ggarrange(All_but_china$graphTotal, All_but_china$graphDeath, ncol=2)
+print(All_but_china$modelTotal)
+print(All_but_china$modelDeath)
+
+```
+
+The equation only work if the environment stay constant, but in reality, they should be an equation of time too. This is too much of data and time beyond the model here. 
