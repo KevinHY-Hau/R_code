@@ -1,0 +1,248 @@
+---
+title: "Covid-19 Second Wave Gompertz Model"
+author: "Kevin Hon Yin Hau"
+date: "28/08/2020"
+output: html_document
+---
+
+```{r setup, include=TRUE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Covid-19 Second wave gompertz model
+
+Update on
+```{r run time}
+Sys.time()
+```
+
+
+### Library
+```{r library, include=TRUE}
+library(ggplot2)
+library(stringi)
+library(dplyr)
+library(egg)
+
+# if xlsx format
+library(openxlsx)
+library(janitor)
+```
+
+## Data
+```{r data, include=TRUE}
+# file name
+DF <- openxlsx::read.xlsx("https://www.ecdc.europa.eu/sites/default/files/documents/COVID-19-geographic-disbtribution-worldwide-2020-08-28.xlsx")
+
+names(DF)[c(1,5:7,11)] <- c('DateRep','NewConfCases','NewDeaths','CountryExp','x')
+DF$CountryExp <- stri_trans_general(gsub("_"," ", DF$CountryExp), id = "Title")
+DF$DateRep <- janitor::excel_numeric_to_date(DF$DateRep)
+
+```
+
+## Extract data function
+
+```{r data fn, include=TRUE}
+covid_Country_Data <- function(DF, countryName=NA){
+  require(dplyr)
+  
+  # extract country data or all data
+  if(length(countryName)==0||is.na(countryName)||countryName=="all"){
+    DF_country <- DF %>%
+      group_by(DateRep) %>%
+      summarise(NewConfCases=sum(NewConfCases),
+                NewDeaths=sum(NewDeaths)) %>% mutate(CountryExp="All")
+  } else {
+    DF_country <- DF %>%
+      filter(tolower(CountryExp) %in% tolower(countryName)) %>%
+      arrange(DateRep)
+  }
+  
+  # create cumulative data
+  as.data.frame(DF_country %>% 
+                  mutate(Total = cumsum(NewConfCases),
+                         TotalDeath = cumsum(NewDeaths),
+                         DateDiff = as.Date(DateRep) - lag(as.Date(DateRep))) %>% 
+                  filter(Total>0) %>% 
+                  mutate(Day = cumsum(coalesce(as.integer(DateDiff),0L))))
+}  
+```
+
+## Spain Data
+```{r spain, include=TRUE}
+spainData <- covid_Country_Data(DF, "Spain")[,c("Day","Total")]
+```
+
+
+## Plot data and gradient from data
+```{r plot, include=TRUE}
+
+# calculate the gradient (basically difference from each day in this case)
+spainDataDif <- data.frame(grad=diff(spainData$Total,1)/diff(spainData$Day,1))
+spainDataDif$Day <- 1:nrow(spainDataDif)
+
+ggarrange( 
+  ggplot(spainData, aes(Day, Total)) +
+  geom_point(col="purple", alpha=0.5) +
+  labs(title="Spain Covid-19 cumulative cases"),
+
+  ggplot(spainDataDif, aes(Day, grad)) +
+  geom_point(col="blue", alpha=0.5) +
+  labs(title="Spain Covid-19 gradient on data"), 
+nrow=2)
+
+```
+
+## Determine the cutting off of 1st wave and 2nd wave and k slope
+```{r loop to find subset with max r-sq, include=TRUE}
+
+spainDataDif$r2 <- 0
+
+# loop to calculate the quadratic r-sq by fitting subsetting data truncating the front
+for(i in 1:(nrow(spainDataDif)-10)){
+  spainDataDif$r2[i] <- summary(lm(grad~Day+I(Day^2),data=spainDataDif[spainDataDif$Day > i,]))$r.squared
+}
+
+# find the point with max r-sq
+idx <- which(spainDataDif$r2 == max(spainDataDif$r2))[1]
+
+# calculate the quadratic again
+findLocal <- lm(grad~Day+I(Day^2),data=spainDataDif[spainDataDif$Day > idx,])
+
+ggarrange(
+ggplot(spainDataDif, aes(Day, r2)) + geom_line(col="red") +
+  labs(title =paste0("Max r-sq (", round(spainDataDif$r2[idx]*100,1), "%) occurs at day ",idx),
+       ylab = "r-sq"),
+ggplot(spainDataDif, aes(Day, grad)) +
+  geom_point(col="blue", alpha=0.5) +
+  geom_line(data = 
+              data.frame(
+                Day=(idx+1):nrow(spainDataDif), 
+                grad=predict(findLocal)),
+            aes(Day, grad), col="red")+
+  labs(title="Spain Covid-19 gradient on data"), nrow=2)
+
+# calcualte the differentiation to determine the lowest point of the quadratic
+cutting <- round(-0.5*coef(findLocal)[2]/coef(findLocal)[3],0)
+
+# just use a simple way to determine the k slope
+k_Slope <- coef(lm(Total~Day,spainData[(cutting-10):(cutting+10),]))[2]
+
+
+```
+
+## Define gompertz function
+```{r gomertz, include=TRUE}
+SSgompertzabcd <- function (time, a, b, c, d) {
+  partEq_ <- exp(1 + c*exp(1)*(b - time)/(d - a))
+  partEq <- exp(-partEq_)
+  partGrad <- (d - a) * (partEq * (partEq_ * (c*exp(1)*(b - time)/(d - a)^2)))
+  val <- a + (d - a) * partEq
+  # differentiate of the original gompertz abcd
+  .grad <- array(0, c(length(val), 4), list(NULL, c("a", "b", "c", "d")))
+  .grad[, "a"] <- 1 - (partGrad + partEq)
+  .grad[, "b"] <- -((d - a) * (partEq * (partEq_ * (c * exp(1)/(d - a)))))
+  .grad[, "c"] <- -((d - a) * (partEq * (partEq_ * (exp(1) * (b - time)/(d - a)))))
+  .grad[, "d"] <- partEq + partGrad
+  attr(val, "gradient") <- .grad
+  val
+}
+
+attributes(SSgompertzabcd)$initial <- function (mCall, data, LHS){
+  sXY <- sortedXyData(mCall[["time"]], LHS, data)
+  if(nrow(sXY) < 5) stop("Too few distinct input values to fit the Gompertz model")
+  y0 <- NLSstLfAsymptote(sXY)
+  ymax <- NLSstRtAsymptote(sXY)
+  # rate should a positive value in the direction of change
+  grad <- diff(sXY$y, 1)/diff(sXY$x, 1)
+  rate <- max(grad)
+  xpos <- which(grad == rate)[1]
+  lag <- mean(sXY$x[c(xpos-2, xpos + 2)]) - (mean(sXY$y[c(xpos-2, xpos + 2)]) - y0)/rate
+  if(!is.finite(lag)) lag <- 0
+  val <- c(max(y0,0.1), lag, rate, ymax)
+  names(val) <- mCall[c("a", "b", "c", "d")]
+  val
+}
+
+attributes(SSgompertzabcd)$pnames <- c("a","b","c","d")
+attributes(SSgompertzabcd)$class <- "selfStart"
+
+
+# adding extra k slope, not a self start function yet, as this need a lot of research
+gompertzabcdk <- function (time, a, b, c, d, k) {
+  a + (d+k*time - a) * exp(-exp(1 + c*exp(1)*(b - time)/(d+k*time - a)))
+}
+
+# for the second wave
+gompertzabcdk2nd <- function (time, a, b1, c1, d1, k1, b2, c2, d2) {
+  a + (d1+k1*time-a)*exp(-exp(1+c1*exp(1)*(b1-time)/(d1+k1*time-a)))+(d2-a)*exp(-exp(1+ c2*exp(1)*(b2-time)/(d2-a)))
+
+}
+
+```
+
+## Calculate 1st wave initial value
+```{r initial of 1st wave, include=TRUE}
+
+# only use the first part and use the original way to calculate the a and b1
+spainData1stIni <- spainData[spainData$Day <= cutting, ]
+ini_abcdk <- getInitial(Total~SSgompertzabcd(Day,a,b,c,d), spainData1stIni)
+
+# take away the k slope
+ini_abcdk[3] <- ini_abcdk[3] - k_Slope
+
+# here just use a simple way to determine the d1 value by putting somewhere between the maximum r-sq and cutting point
+ini_abcdk[4] <- spainData$Total[round((cutting+idx)/2,0)]-k_Slope*spainData$Day[round((cutting+idx)/2,0)]
+
+# initial value for 1st wave including k slope
+spainData1stIni$iniCurve <- gompertzabcdk(spainData1stIni$Day, ini_abcdk[1], ini_abcdk[2], ini_abcdk[3], ini_abcdk[4] , k_Slope)
+
+ggplot(spainData1stIni, aes(Day, Total)) + geom_point(col="purple", alpha=0.5) +
+  geom_line(aes(Day, iniCurve), col="dark blue") + 
+  labs(title="Spain Covid-19 1st wave data with inital curve")
+
+```
+
+## Calculate 2nd wave initial value and compare initial curve with data
+```{r 2nd_wave, include=TRUE}
+
+# transform the 2nd wave so that it is similar to the original gompertz abcd
+spainData2ndIni <- spainData[spainData$Day > cutting, ]
+spainData2ndIni$Day <- 1:nrow(spainData2ndIni)
+spainData2ndIni$Total <- spainData2ndIni$Total - spainData2ndIni$Total[1] 
+ini_abcd <- getInitial(Total~SSgompertzabcd(Day,a,b,c,d), spainData2ndIni)
+
+# calcualte the initial curve from the estimated initial value before putting in the nls
+spainData$iniCurve <- gompertzabcdk2nd(spainData$Day,ini_abcdk[1],ini_abcdk[2],ini_abcdk[3], ini_abcdk[4], k_Slope, cutting + ini_abcd[2], ini_abcd[3], ini_abcd[4])
+
+ggplot(spainData, aes(Day, Total)) + geom_point(col="purple", alpha=0.5) +
+  geom_line(aes(Day, iniCurve), col="dark blue") + 
+  labs(title="Spain Covid-19 data with inital curve for both wave")
+
+```
+
+# Fit the NLS model
+```{r fit the data, include=TRUE}
+
+# fit the nls and print result
+spain_nls <- nls(Total ~ gompertzabcdk2nd(Day, a,b1,c1,d1,k1,b2,c2,d2),
+                   spainData,
+                   start=list("a"=ini_abcdk[1], "b1"=ini_abcdk[2],"c1"=ini_abcdk[3], "d1"=ini_abcdk[4], "k1"=k_Slope, "b2"=cutting + ini_abcd[2], "c2"=ini_abcd[3], "d2"=ini_abcd[4]), algorithm="port")
+
+print(summary(spain_nls))
+
+
+```
+# Plot the prediction
+```{r plot data and prediction, include = TRUE}
+
+new_fitted <-data.frame(Day=1:300) %>% 
+  mutate(fitted = predict(spain_nls, newdata=data.frame(Day=1:300)))
+
+ggplot(spainData, aes(Day, Total)) + geom_point(col="purple", alpha=0.5) +
+  geom_line(data=new_fitted, aes(Day, fitted), col="dark grey", size=1) + 
+  labs(title="Spain Covid-19 (2020-08-28) Cumulative Total and Fitted Curve")
+
+
+```
